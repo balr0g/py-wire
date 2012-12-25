@@ -138,6 +138,15 @@ Not much documentation is currently available.  I'm going to try to get an FAQ
 
 7 History
 ==========
+0.3.1 - 2004-09-01
+- Better designed queue processing and transfer functions
+- Fix infinite loop when trying to download the root directory
+- New functions to process the queues in new threads
+- Fix saving of queues that have functions
+- Use a single queue file instead of four separate files
+- Use container instead of attribute access for wireprivileges
+- Additional configuration options (loglevel, queuefile)
+- Fix return codes in some functions
 0.3 - 2004-08-14
 - Support Wired Protocol 1.1 (Wired RFC 2)
 - Keep track of server information (such as protocol version), and connection

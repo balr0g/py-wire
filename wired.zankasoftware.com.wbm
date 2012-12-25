@@ -2,22 +2,25 @@
 
 [wire]
 # IP address or host name and port of Wired Server
-host=127.0.0.1
-port=2000
+host=wired.zankasoftware.com
+#port=2000
 
 # Nickname on server
-nick=Default User
+#nick=Default User
 
 # Account name and password with which to login
-login=guest
-password=
+#login=guest
+#password=
 
 # Icon to use
-icon=0
+#icon=0
 
 # Status and custom image file name to use
 #status=
 #imagefilename=
+
+# Logging Level (must be DEBUG, INFO, WARNING, ERROR, or CRITICAL)
+#loglevel=DEBUG
 
 # Name of application using py-wire (or full client version string)
 #appname=
@@ -26,6 +29,9 @@ icon=0
 # Default host and server directories (defaultserverdir must end with /)
 #defaulthostdir=
 #defaultserverdir=/
+
+# File in which to save upload and download queues
+#queuefile=
 
 # If you want to store only the password hash in this file, and not use the password
 #usepasswordhash=1
