@@ -32,7 +32,7 @@ import logging
 import cPickle
 from ConfigParser import RawConfigParser
 
-__version__ = '0.2'
+__version__ = '0.2.1'
 
 ## Default logger
 
@@ -433,14 +433,18 @@ class wire:
             returned from the wired server.  Keys should be 3 digit integers, 
             values should be functions. For example, if you have a key of 400 
             in callbacks, the corresponding function will be called whenever 
-            the wired server returns that code.  These functions are passed 2
-            arguments: the wire object and a list of the arguments to the
-            server response (the response string split by the ascii field
-            separator).
+            the wired server returns that code.  These functions are passed 3
+            arguments: the wire object,a list containing the arguments, and a
+            flag denoting whether this library failed to handle the response 
+            correctly (0 for success, 1 for failure).
             
             There are also some string keys that are recognized for various 
             events that don't correspond with codes the server returns.  The 
-            first argument is always this instance of wire. :            
+            first argument is always this instance of wire. : 
+            anymessage(wire, code, args, success):
+                Called in addition to any normal callback response.  Useful if 
+                you are handling all the callbacks in a similar way but don't 
+                want to define them all individually.
             controlconnectionclosed(wire):
                 Called whenever the control connection to the server is closed.
                 Useful for reconnecting.
@@ -467,13 +471,14 @@ class wire:
         self.nick = 'Default User'
         self.login = 'guest'
         self.password = ''
+        self.passwordhash = ''
         self.appname = ''
         self.icon = 0
         self.callbacks = {}
         self.log = printlogger
         self.buffer = ''
         self.defaulthostdir = os.getcwd()
-        self.passwordhash = ''
+        self.clientversionstring = ''
         self.usepasswordhash = False
         self.errortimeout = 120
         self.downloadcheckbuffer = 1024
@@ -487,6 +492,10 @@ class wire:
         self.lock = thread.allocate_lock()
         self.socket, self.tlssocket = None, None
         self.loadconfig(config, **kwargs)
+        if self.clientversionstring == '':
+            self.clientversionstring = self.getclientversionstring()
+        if not self.usepasswordhash and self.password != '':
+            self.passwordhash = sha.new(self.password.encode('utf8','ignore')).hexdigest()
         self._resetfilestructures()
         
     ### Functions that should not be called by the user
@@ -649,7 +658,8 @@ class wire:
         self.acquirelock(True)
         self.socket.settimeout(None)
         data = u''
-        responses = {202:self.gotpong, 300:self.gotchat, 301:self.gotactionchat,
+        responses = {200:self.gotserverinfo, 201:self.gotloginsucceeded, 
+            202:self.gotpong, 300:self.gotchat, 301:self.gotactionchat,
             302:self.gotclientjoin, 303:self.gotclientleave, 
             304:self.gotstatuschange, 305:self.gotprivatemessage, 
             306:self.gotclientkicked, 307:self.gotclientbanned, 
@@ -663,6 +673,7 @@ class wire:
             420:self.gotsearchlist, 421:self.gotsearchlistdone,
             500:self.gotcommandfailed, 501:self.gotcommandnotrecognized,
             502:self.gotcommandnotimplemented, 503:self.gotsyntaxerror,
+            510:self.gotloginfailed, 511:self.gotbanned,
             512:self.gotclientnotfound, 513:self.gotaccountnotfound, 
             514:self.gotaccountexists, 515:self.gotcannotbedisconnected,
             516:self.gotpermissiondenied, 520:self.gotfilenotfound,
@@ -677,6 +688,7 @@ class wire:
                 # Get the data from the socket, and convert it to unicode
                 data += self.tlssocket.recv(self.buffersize).decode('utf8')
                 self.acquirelock(True)
+                failure = None
                 nextcommandend = data.find('\04')
                 if nextcommandend == -1:
                     self.releaselock(True)
@@ -688,24 +700,22 @@ class wire:
                 data = data[nextcommandend+1:]
                 self.log.debug('Server response: %s' % nextcommand)
                 if commandnum in responses:
-                    responses[commandnum](args)
+                    failure = responses[commandnum](args)
                 else:
                     self.gotunrecognizedmessage(nextcommand)
                     if 'gotunrecognizedmessage' in self.callbacks:
                         self.callbacks['gotunrecognizedmessage'](self, nextcommand)
                 if commandnum in self.callbacks:
-                    self.callbacks[commandnum](self, args)
+                    self.callbacks[commandnum](self, args, failure)
+                if 'anymessage' in self.callbacks:
+                    self.callbacks['anymessage'](self, commandnum, args, failure)
                 self.releaselock(True)
         except (socket.error, TLSError, ValueError):
             self.log.error("Control connection closed: %s %s %s" % sys.exc_info())
         except:
-            self.tlssocket = None
-            self.socket = None
             self.log.error("Serious error in listen thread: %s %s %s" % sys.exc_info())
             self.releaselock(True)
-        self.tlssocket = None
-        self.socket = None
-        self.log.info('Disconnected from server')
+        self.disconnect()
         if 'controlconnectionclosed' in self.callbacks:
             self.callbacks['controlconnectionclosed'](self)
             
@@ -1065,6 +1075,27 @@ class wire:
         self.releaselock(lock)
         return 0
         
+    def getclientversionstring(self):
+        """Return client version string"""
+        osname = ''
+        if self.appname == '':
+            self.appname = 'py-wire/%s' % self.version
+        libversion = '(py-wire/%s; tlslite/%s)' % (self.version, tlsversion)
+        if os.name == 'posix':
+            osname = '; '.join(os.popen('uname -srm','r').read()[:-1].split())
+        elif os.name == 'nt':
+            wininfo = sys.getwindowsversion()
+            if wininfo[3] == 1:
+                osname = 'Windows 9x'
+            elif wininfo[3] == 2:
+                osname = 'Windows NT'
+            else:
+                osname = 'Windows'
+            osname += '; %s.%s; i386' % (wininfo[0], wininfo[1])
+        else:
+            osname = '%s; Unknown; Unknown' % sys.platform
+        return "%s (%s) %s" % (self.appname, osname, libversion)
+        
     def loadconfig(self, config, **kwargs):
         """Get configuration from file or keyword arguments
         
@@ -1249,75 +1280,36 @@ class wire:
     def connect(self, lock = True):
         """Connect to the Wired Server"""
         self.acquirelock(lock)
-        # Initialize a bunch of connection related variables
         self._resetfilestructures()
-        # Figure out connection string
-        osname = ''
-        self.passwordhash = ''
-        if self.appname == '':
-            self.appname = 'py-wire/%s' % self.version
-        libversion = '(py-wire/%s; tlslite/%s)' % (self.version, tlsversion)
-        if os.name == 'posix':
-            osname = '; '.join(os.popen('uname -srm','r').read()[:-1].split())
-        elif os.name == 'nt':
-            wininfo = sys.getwindowsversion()
-            if wininfo[3] == 1:
-                osname = 'Windows 9x'
-            elif wininfo[3] == 2:
-                osname = 'Windows NT'
-            else:
-                osname = 'Windows'
-            osname += '; %s.%s; i386' % (wininfo[0], wininfo[1])
-        else:
-            osname = '%s; Unknown; Unknown' % sys.platform
-        self.clientversionstring = "%s (%s) %s" % (self.appname, osname, libversion)
-        # Determine password hash and connect 
-        if not self.usepasswordhash and self.password != '':
-            self.passwordhash = sha.new(self.password.encode('utf8','ignore')).hexdigest()
+        failure = True
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(self.timeout)
             self.socket.connect((self.host,self.port))
             self.tlssocket = TLSConnection(self.socket)
             self.tlssocket.handshakeClientCert()
-            self._send("HELLO\04")
-            self.connectionresponse = self.tlssocket.recv(self.buffersize)
-            if self.connectionresponse[:3] != '200':
-                self.log.error('You have been banned from %s' % self.host)
-                self.tlssocket =  None
-                self.socket = None
-                self.releaselock(lock)
-                return 1
-            self.log.info('Connected to %s' % self.host)
-            # Add miscellaneous info and login
-            self.changenick(self.nick, False)
-            self.changeicon(self.icon, False)
-            self.log.debug('Sending client string: %s' % self.clientversionstring)
-            self._send("CLIENT %s\04" % self.clientversionstring)
-            self.log.debug('Logging in as: %s' % self.login)
-            self._send("USER %s\04" % self.login)
-            self.log.debug('Sending password')
-            self._send("PASS %s\04" % self.passwordhash)
-            self.loginresponse = self.tlssocket.recv(self.buffersize)
-            if self.loginresponse[:3] != '201':
-                self.log.error('Login as %s not successful' % self.login)
-                self.tlssocket =  None
-                self.socket = None
-                self.releaselock(lock)
-                return 1
-            self.log.info('Logged into %s as %s' % (self.host, self.login))
-            # It's all good, so get privileges and the user list for the public chat
-            self.getprivileges(False)
-            self.getuserlist(1, False)
-        except (socket.error, TLSError, ValueError):
+            thread.start_new_thread(self._listen,())
+            thread.start_new_thread(self._pingserver,())
+            failure = self._send("HELLO\04")
+        except (socket.error, TLSError, ValueError, AssertionError):
             self.log.error("Couldn't connect or login to server: %s %s %s" % sys.exc_info())
             self.tlssocket =  None
             self.socket = None
-            self.releaselock(lock)
-            return 1
         self.releaselock(lock)
-        thread.start_new_thread(self._listen,())
-        thread.start_new_thread(self._pingserver,())
+        return int(failure)
+        
+    def disconnect(self, lock = True):
+        """Disconnect from the Wired Server"""
+        self.acquirelock(lock)
+        self.log.info('Disconnecting from server')
+        if self.tlssocket != None:
+            try:
+                self.tlssocket.close()
+            except (socket.error, TLSError, ValueError, AssertionError):
+                pass
+            self.tlssocket = None
+        self.socket = None
+        self.releaselock(lock)
         return 0
         
     def getprivileges(self, lock = True):
@@ -1677,14 +1669,7 @@ class wire:
             # I don't believe that the server will disconnect you if you send
             # it a leave message with a chatid of 1, but you should only be 
             # doing this if you want to leave the server
-            self.log.info('Left public chat, disconnecting from server')
-            if self.tlssocket != None:
-                try:
-                    self.tlssocket.close()
-                except (socket.error, TLSError, ValueError):
-                    pass
-                self.tlssocket = None
-            self.socket = None
+            self.disconnect(False)
         self.releaselock(lock)
         return int(failure)
         
@@ -1975,6 +1960,26 @@ class wire:
     ### Called on responses from server
     
     ## 2xx Informational
+    
+    def gotserverinfo(self, args):
+        """Received server information (200)"""
+        self.log.info('Connected to %s' % self.host)
+        self.changenick(self.nick, False)
+        self.changeicon(self.icon, False)
+        self.log.debug('Sending client string: %s' % self.clientversionstring)
+        self._send("CLIENT %s\04" % self.clientversionstring)
+        self.log.debug('Logging in as: %s' % self.login)
+        self._send("USER %s\04" % self.login)
+        self.log.debug('Sending password')
+        self._send("PASS %s\04" % self.passwordhash)
+        return 0
+        
+    def gotloginsucceeded(self, args):
+        """Received login successful (201)"""
+        self.log.info('Logged into %s as %s' % (self.host, self.login))
+        self.getprivileges(False)
+        self.getuserlist(1, False)
+        return 0
     
     def gotpong(self, args):
         """Received pong response (202)"""
@@ -2347,6 +2352,18 @@ class wire:
     def gotsyntaxerror(self, args):
         """Received there was a syntax error in your command (503)"""
         self.log.error('There was a syntax error in the command you sent')
+        return 0
+        
+    def gotloginfailed(self, args):
+        """Received login failed (510)"""
+        self.log.error('The login failed, the login and/or password is not valid')
+        self.disconnect(False)
+        return 0
+        
+    def gotbanned(self, args):
+        """Received banned (511)"""
+        self.log.error('You have been banned from this server')
+        self.disconnect(False)
         return 0
         
     def gotclientnotfound(self, args):

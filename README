@@ -138,6 +138,12 @@ Not much documentation is currently available.  I'm going to try to get an FAQ
 
 7 History
 ==========
+0.2.1 - 2004-08-02
+- Break connect function into smaller components, allowing for callbacks for
+  gotserverinfo, gotloginsucceeded, gotbanned, and gotloginfailed
+- Add anymessage callback as a catchall callback for any server message
+- Pass a flag to callbacks signifying whether the library had any problems with
+  the server's message
 0.2 - 2004-08-01
 - Allow use of configuration file (with values overriden by keyword arguments)
 - Check that resumed download matches local file, instead of assuming it does
