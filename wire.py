@@ -1028,8 +1028,7 @@ class wire:
             tlssocket = TLSConnection(sock)
             tlssocket.handshakeClientCert()
             self.log.debug('Sending transfer request for download: %s' % unicode(transfer))
-            # Don't need to utf encode this because hash is always hexadecimal
-            tlssocket.send("TRANSFER %s\04" % hash)
+            tlssocket.send("TRANSFER %s\04" % hash.encode('utf8'))
             sock.settimeout(None)
             self.log.debug('Opening file for download: %s' % unicode(transfer))
             if needtocheck:
@@ -1207,7 +1206,7 @@ class wire:
             tlssocket = TLSConnection(sock)
             tlssocket.handshakeClientCert()
             self.log.debug('Sending transfer request for upload: %s' % unicode(transfer))
-            tlssocket.send("TRANSFER %s\04" % hash)
+            tlssocket.send("TRANSFER %s\04" % hash.encode('utf8'))
             sock.settimeout(None)
             self.log.info('Starting upload of %s at offset %s' % (unicode(transfer), offset))
             transfer.starttime = time.time()
