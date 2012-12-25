@@ -30,8 +30,9 @@ import os
 import sys
 import logging
 import cPickle
+from ConfigParser import RawConfigParser
 
-__version__ = '0.1'
+__version__ = '0.2'
 
 ## Default logger
 
@@ -284,7 +285,6 @@ class wirenewspost:
         self.poster = '%s' % poster
         self.posttime = parsewiredtime(posttime[:19])
         self.post = '%s' % post
-        self.id = sha.new(('%s%s%s' % (poster, posttime, post)).encode('ascii','ignore')).hexdigest()
         
     def __unicode__(self):
         return "Wired News Article: \nposter=%s \nposttime=%s \n%s" % (self.poster, time.strftime('%Y-%m-%dT%H:%M:%S',self.posttime), self.post)
@@ -323,6 +323,20 @@ class wireaccount:
 
     def __str__(self):
         return (unicode(self)).encode('ascii','ignore')
+        
+    def setpassword(self, password):
+        """Set a new password for this account
+        
+        password (str) - the user's new password
+        
+        Notes: This function creates the SHA-1 password for the given password 
+        and associates that hash with this account.  If you would like to set
+        the hash directly, just call wireaccount.password = hash. Also, this 
+        function doesn't change their password on the server, you need to call 
+        wire.editaccount to do so.
+        """
+        self.password = sha.new(('%s' % password).encode('utf8','ignore')).hexdigest()
+        return 0
         
 class wiretransfer:
     """Information on uploads/downloads by clients on the Wired server"""
@@ -407,19 +421,13 @@ class wire:
     See http://www.zankasoftware.com/wired/rfc1.txt for description of 
     the Wired protocol.
     """
-    def __init__(self,host='127.0.0.1',port=2000,nick='Default User', 
-       login='guest',password='',icon=0, appname = '', 
-       timeout = 15, logger = printlogger, callbacks = {}):
+    def __init__(self,config='', **kwargs):
         """Initialize connection parameters
         
-        host (str) = IP Address or DNS name of Wired server
-        port (int) = port on which Wired server listens 
-        nick (str) = name shown in user list
-        login (str) = account name used to login
-        password (str) = password for account
-        icon (int) = number of icon that shows up in user list
-        appname (str) = name of the application using this library
-        timeout (int) = timeout for some initial connections
+        See wire.conf for a list of keyword arguments you can provide.
+        In addition to those listed in wire.conf, the following are also
+        accepted:
+        
         logger (logging.Logger) = the python logger for the connection
         callbacks (dict) = contains callback functions, corresponding to codes
             returned from the wired server.  Keys should be 3 digit integers, 
@@ -453,46 +461,56 @@ class wire:
         """
         self.version = __version__
         self.buffersize = 8192
-        self.timeout = timeout
-        self.host = host
-        self.port = int(port)
-        self.nick = nick
-        self.login = login
-        self.password = password
-        self.appname = appname
-        self.icon = int(icon)
-        self.callbacks = callbacks
-        self.log = logger
+        self.timeout = 15
+        self.host = '127.0.0.1'
+        self.port = 2000
+        self.nick = 'Default User'
+        self.login = 'guest'
+        self.password = ''
+        self.appname = ''
+        self.icon = 0
+        self.callbacks = {}
+        self.log = printlogger
         self.buffer = ''
         self.defaulthostdir = os.getcwd()
+        self.passwordhash = ''
+        self.usepasswordhash = False
+        self.errortimeout = 120
+        self.downloadcheckbuffer = 1024
+        self.maxsimultaneousdownloads = 1
+        self.maxsimultaneousuploads = 1
         # defaultserverdir should always end with a slash
         self.defaultserverdir = '/'
         # This library uses threads, and this lock is very important
         # Always acquire the lock before making any changes to the internal
         # data structures
         self.lock = thread.allocate_lock()
-        self.maxsimultaneousdownloads, self.maxsimultaneousuploads = 1, 1
+        self.socket, self.tlssocket = None, None
+        self.loadconfig(config, **kwargs)
         self._resetfilestructures()
         
     ### Functions that should not be called by the user
     
-    def __str__(self):
+    def __unicode__(self):
         return "Wired client, connected to %s:%s as %s" % (self.host, self.port, self.login)
         
-    def __repr__(self):
-        return self.__str__()
-    
+    def __str__(self):
+        return (unicode(self)).encode('ascii','ignore')
+          
     def _get(self):
         """Download next file in download queue"""
         # This function should only be called while in posession of the lock
         while True:
+            if self.tlssocket == None or self.tlssocket.closed:
+                self.log.debug('_get called, but control connection has been closed')
+                return 1
             if self.downloadqueue == []:
                 self.log.debug('_get called with nothing in downloadqueue')
-                return 1
+                return 0
             numcurrentdownloads = len(self.currentdownloads)
             if  numcurrentdownloads >= self.maxsimultaneousdownloads:
                 self.log.debug('_get called, but currently downloading %s files' % numcurrentdownloads)
-                return 1
+                return 0
             # If you are trying to download a directory with many subdirectories
             # and files, and all of the information is already in the file and 
             # filelist caches, _get can take a very long time.  Since this 
@@ -507,6 +525,13 @@ class wire:
             # a depth first traversal of the subdirectories and files of that
             # path, which are processed on a last in first out basis
             download = self.downloadqueue[-1]
+            if not isinstance(download, wiredownload):
+                if callable(download):
+                    download()
+                if isinstance(download,(tuple,list)) and callable(download[0]):
+                    download[0](*download[1], **download[2])
+                self.downloadqueue.pop()
+                continue
             serverpath, hostpath = download.serverpath, download.hostpath
             self.log.debug('_get called with %s items in queue, next item download "%s" to "%s"' % (len(self.downloadqueue),serverpath,hostpath))
             if serverpath not in self.files:
@@ -514,7 +539,7 @@ class wire:
                 # by the user.  Files and subdirectories below that path should
                 # already have this information by the time they get to this step
                 self.getfileinfo(serverpath, False)
-                return 1
+                return 0
             if download.serverfile == None:
                 # Set the serverfile for the download, so we can access the 
                 # size and checksum information, if available
@@ -523,14 +548,14 @@ class wire:
                 # Path taken for directories
                 if serverpath not in self.filelists:
                     self.getfilelist(serverpath, False)
-                    return 1
+                    return 0
                 else:
                     if not os.path.exists(hostpath):
                         # If the directory we are downloading doesn't exist
                         # on the local filesystem, create it
                         os.mkdir(hostpath)
                     elif not os.path.isdir(hostpath):
-                        self.log.error('Can\'t download directory "%s", destination (%s) is file ' % (serverpath, hostpath))
+                        self.log.error('Can\'t download directory , destination is file: %s' % unicode(download))
                         self.downloadqueue.pop()
                         continue
                 # Remove the directory from the queue
@@ -548,44 +573,74 @@ class wire:
                 # Path taken for files
                 if os.path.exists(hostpath):
                     if not os.path.isfile(hostpath):
-                        self.log.error('Can\'t download file "%s", destination (%s) is directory ' % (serverpath, hostpath))
+                        self.log.error('Can\'t download file, destination is directory: %s' % unicode(download))
+                    elif self.files[serverpath].size != os.path.getsize(hostpath):
+                        self.log.error('Download already marked complete, but file sizes do not match: Host: %s (%s) Server: %s (%s)' % (hostpath, os.path.getsize(hostpath), serverpath, self.files[serverpath].size))
+                    else:
+                        self.log.debug('Download already complete: %s' % unicode(download))
+                    self.downloadqueue.pop()
+                    continue
+                hostpathwpf = hostpath + '.wpf'
+                if(os.path.exists(hostpathwpf)):
+                    if not os.path.isfile(hostpathwpf):
+                        self.log.error('Can\'t download file, destination is directory: %s' % unicode(download))
                         self.downloadqueue.pop()
                         continue
-                    elif self.files[serverpath].size <= os.path.getsize(hostpath):
-                        self.log.debug('Download already complete: %s' % serverpath)
+                    elif self.files[serverpath].size <= os.path.getsize(hostpathwpf):
+                        if self.files[serverpath].size < os.path.getsize(hostpathwpf):
+                            self.log.error('File on server is smaller than partially downloaded file: Host: %s (%s) Server: %s (%s)' % (hostpathwpf, os.path.getsize(hostpathwpf), serverpath, self.files[serverpath].size))
+                        else:
+                            self.log.warning('Download already complete, but still marked as partial file: $s' % unicode(download))
                         self.downloadqueue.pop()
                         continue
                     elif self.files[serverpath].checksum == None:
                         # If the file exists locally and we don't have the
                         # remote checksum, we need to get it to see if it matches
                         self.getfileinfo(serverpath, False)
-                        return 1
-                    fil = file(hostpath,'rb')
+                        return 0
+                    size = os.path.getsize(hostpathwpf)
+                    fil = file(hostpathwpf,'rb')
                     checksum = sha.new(fil.read(1048576)).hexdigest()
                     fil.close()
                     if self.files[serverpath].checksum == checksum:
                         # If the checksums match, we don't have to download the 
                         # entire file again
-                        download.offset = os.path.getsize(hostpath)
+                        if size > self.downloadcheckbuffer:
+                            download.offset = size -  self.downloadcheckbuffer
                     else:
                         # If the checksums don't match, we'll try to rename the
                         # old file, or remove it if it looks like we already have
                         # a second copy of it
                         try:
-                            newname = '%s__%s' % (hostpath, checksum)
-                            os.rename(hostpath, newname)
+                            self.log.info("Checksums don't match, attempting to rename local file: %s" % unicode(download))
+                            fil = file(hostpathwpf,'rb')
+                            checksum2 = checksum
+                            if size > 1048576:
+                                fil.seek(-1048576,2)
+                                checksum2 = sha.new(fil.read()).hexdigest()
+                            newname = '%s.%s.wfd' % (hostpath, checksum2)
+                            fil.close()
+                            os.rename(hostpathwpf, newname)
                         except OSError:
                             try:
-                                if os.path.exists(newname) and os.path.isfile(newname) and os.path.getsize(hostpath) == os.path.getsize(newname):
-                                    os.remove(hostpath)
+                                if os.path.exists(newname) and os.path.isfile(newname) and os.path.getsize(hostpathwpf) == os.path.getsize(newname):
+                                    self.log.info("Rename failed, looks like the files match, attempting to remove local file: %s" % unicode(download))
+                                    os.remove(hostpathwpf)
+                                else:
+                                    self.log.error("Skipping download, rename failed and looks like the files don't match: %s" % unicode(download))
+                                    self.downloadqueue.pop()
+                                    continue
                             except OSError:
-                                self.log.error("Skipping download of \"%s\", checksums don't match and local file (%s) couldn't be renamed or removed:" % (serverpath, hostpath))
+                                self.log.error("Skipping download, checksums don't match and local file couldn't be renamed or removed: %s" % unicode(download))
                                 self.downloadqueue.pop()
                                 continue
-                self.log.debug('Sending get message for transfer of "%s" to "%s"' % (serverpath, hostpath))
+                self.log.debug('Sending get message for transfer: %s' % unicode(download))
                 self.requested['downloads'].append(serverpath)
                 self.currentdownloads[serverpath] = self.downloadqueue.pop()
-                self._send("GET %s\x1c%s\04" % (serverpath, download.offset))
+                if self._send("GET %s\x1c%s\04" % (serverpath, download.offset)):
+                    self.requested['downloads'].pop()
+                    del self.currentdownloads[serverpath]
+                    return 1
                 continue
             return 1
                       
@@ -618,7 +673,7 @@ class wire:
         self.log.debug('Starting Listening Loop')
         self.releaselock(True)
         try:
-            while not self.tlssocket.closed:
+            while self.tlssocket != None and not self.tlssocket.closed:
                 # Get the data from the socket, and convert it to unicode
                 data += self.tlssocket.recv(self.buffersize).decode('utf8')
                 self.acquirelock(True)
@@ -644,10 +699,12 @@ class wire:
         except (socket.error, TLSError, ValueError):
             self.log.error("Control connection closed: %s %s %s" % sys.exc_info())
         except:
+            self.tlssocket = None
+            self.socket = None
             self.log.error("Serious error in listen thread: %s %s %s" % sys.exc_info())
-            self.tlssocket.close()
-            self.socket.close()
             self.releaselock(True)
+        self.tlssocket = None
+        self.socket = None
         self.log.info('Disconnected from server')
         if 'controlconnectionclosed' in self.callbacks:
             self.callbacks['controlconnectionclosed'](self)
@@ -656,17 +713,19 @@ class wire:
         """Ping the server on a regular basis"""
         # The only purpose of this is to keep the connection alive
         time.sleep(600)
+        failure = False
         try:
-            while not self.tlssocket.closed:
+            while not failure and self.tlssocket != None and not self.tlssocket.closed:
                 self.acquirelock(True)
                 if not self.tlssocket.closed:
                     self.log.debug('Pinging server')
                     self.requested['pong'] = True
-                    self._send("PING\04")
+                    failure = self._send("PING\04")
                 if 'ping' in self.callbacks:
                     self.callbacks['ping'](self)
                 self.releaselock(True)
-                time.sleep(600)
+                if not failure:
+                    time.sleep(600)
         except :
             self.log.error("Serious error in _pingserver thread: %s %s %s" % sys.exc_info())
             self.releaselock(True)
@@ -675,16 +734,26 @@ class wire:
         """Upload next file in upload queue"""
         # Most of the comments in _get are also applicable here
         while True:
+            if self.tlssocket == None or self.tlssocket.closed:
+                self.log.debug('_put called, but control connection has been closed')
+                return 1
             if self.uploadqueue == []:
                 self.log.debug('_put called with nothing in uploadqueue')
-                return 1
+                return 0
             numcurrentuploads = len(self.currentuploads)
             if  numcurrentuploads >= self.maxsimultaneousuploads:
                 self.log.debug('_put called, but currently uploading %s files' % numcurrentuploads)
-                return 1
+                return 0
             self.releaselock(True)
             self.acquirelock(True)
             upload = self.uploadqueue[-1]
+            if not isinstance(upload, wireupload):
+                if callable(upload):
+                    upload()
+                if isinstance(upload,(tuple,list)) and callable(upload[0]):
+                    upload[0](*upload[1], **upload[2])
+                self.uploadqueue.pop()
+                continue
             hostpath, serverpath = upload.hostpath, upload.serverpath
             serverdir = os.path.dirname(serverpath)
             self.log.debug('_put called, queue length %s, next item upload "%s" to "%s"' % (len(self.uploadqueue), hostpath, serverpath))
@@ -695,12 +764,12 @@ class wire:
                 # check that and see if the path we are uploading already exists
                 if serverdir not in self.requested['filelists']:
                     self.getfilelist(serverdir, False)
-                return 1
+                return 0
             elif serverdir not in self.files:
                 # Need to check to see if serverdir is an upload directory
                 if serverdir not in self.requested['fileinfo']:
                     self.getfileinfo(serverdir, False)
-                return 1
+                return 0
             elif os.path.isdir(hostpath):
                 if serverpath not in self.files:
                     if not self.privileges.createfolders :
@@ -710,15 +779,17 @@ class wire:
                     # Unfortunately, we can't check if the creation is succesful
                     self.createfolder(serverpath, False)
                 elif self.files[serverpath].type == 0:
-                    self.log.error('Can\'t upload directory "%s", destination (%s) is file ' % (hostpath, serverpath))
+                    self.log.error('Can\'t upload directory, destination is file: %s' % unicode(upload))
                     self.uploadqueue.pop()
                     continue
                 fils = os.listdir(hostpath)
                 fils.sort()
                 fils.reverse()
                 self.uploadqueue.pop()
+                self.uploadqueue.append([self.getfilelist,[serverpath, False],{}])
                 for fil in fils:
                     self.uploadqueue.append(wireupload(os.path.join(hostpath,fil), "%s/%s" % (serverpath, fil)))
+                continue
             elif os.path.isfile(hostpath):
                 if self.files[serverdir].type == 1 and not self.privileges.uploadanywhere:
                     self.log.error("You don't have the privileges to upload anywhere, try uploading to an Uploads folder.")
@@ -726,31 +797,46 @@ class wire:
                     continue
                 if serverpath in self.files:
                     if self.files[serverpath].type != 0:
-                        self.log.error('Can\'t upload file "%s", destination (%s) is directory ' % (hostpath, serverpath))
+                        self.log.error('Can\'t upload file, destination is directory: %s' % unicode(upload))
+                    elif self.files[serverpath].size > upload.size:
+                        self.log.warning('File on server larger than file on host and already marked complete: %s' % unicode(upload))
+                    elif self.files[serverpath].size == upload.size:
+                        self.log.debug('Upload already complete: %s' % unicode(upload))
+                    else:
+                        self.log.warning('File on server smaller than file on host, but already marked complete: %s' % unicode(upload))
+                    self.uploadqueue.pop()
+                    continue
+                serverpathwt = serverpath + '.WiredTransfer'
+                if serverpathwt in self.files:
+                    if self.files[serverpathwt].size >= upload.size:
+                        if self.files[serverpathwt].size == upload.size:
+                            self.log.warning('Upload already complete, but still marked as a partial file: %s' % unicode(upload))
+                        else:
+                            self.log.error('Partial file on server larger than file to upload: %s' % unicode(upload))
                         self.uploadqueue.pop()
                         continue
-                    elif self.files[serverpath].size >= upload.size:
-                        self.log.debug('Upload already complete: %s' % hostpath)
-                        self.uploadqueue.pop()
-                        continue
-                    elif self.filelists[serverdir]['freeoctets'] < upload.size - self.files[serverpath].size:
-                        self.log.debug('Not enough space to upload: %s' % hostpath)
+                    elif self.filelists[serverdir]['freeoctets'] < upload.size - self.files[serverpathwt].size:
+                        self.log.error('Not enough space to upload: %s' % unicode(upload))
                         self.uploadqueue.pop()
                         continue
                 elif self.filelists[serverdir]['freeoctets'] < upload.size:
-                    self.log.debug('Not enough space to upload: %s' % hostpath)
+                    self.log.error('Not enough space to upload: %s' % unicode(upload))
                     self.uploadqueue.pop()
                     continue
-                self.log.debug('Sending put message for transfer of "%s" to "%s"' % (hostpath, serverpath))
+                self.log.debug('Sending put message for transfer: %s' % unicode(upload))
                 self.requested['uploads'].append(serverpath)
                 self.currentuploads[serverpath] = self.uploadqueue.pop()
-                self._send("PUT %s\x1c%s\x1c%s\04" % (serverpath, upload.size, upload.checksum))
+                if self._send("PUT %s\x1c%s\x1c%s\04" % (serverpath, upload.size, upload.checksum)):
+                    self.requested['uploads'].pop()
+                    del self.currentuploads[serverpath]
+                    return 1
                 continue
             else:
                 # Must be something special if it's not a file or directory
-                # Or maybe it doesn't exist
+                # Or maybe it doesn't exist anymore
                 # In case case, better off not uploading it
                 self.uploadqueue.pop()
+                continue
         
     def _receivefile(self, transfer, offset, hash):
         """Connect to transfer port and download file
@@ -760,13 +846,20 @@ class wire:
             at the end of the file)
         hash (str) - the hash corresponding to this transfer request
         """
+        self.log.debug('_receivefile called with (%s,%s,%s)' % (transfer, offset, hash))
+        sock, tlssocket = None, None
+        offset = int(offset)
+        success, attemptagain = False, False
         hostpath = transfer.hostpath
+        hostpathwpf = hostpath + '.wpf'
         serverpath = transfer.serverpath
         filsize = transfer.serverfile.size
         buffersize = self.buffersize
-        self.log.debug('Opening file for download %s' % hostpath)
-        fil = file(hostpath,'a+b')
-        fil.seek(int(offset))
+        checkbuffer = None
+        checkdata = ""
+        needtocheck = False
+        if offset != 0:
+            needtocheck = True
         self.log.debug('Connecting to transfer socket')
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -774,50 +867,67 @@ class wire:
             sock.connect((self.host,self.port+1))
             tlssocket = TLSConnection(sock)
             tlssocket.handshakeClientCert()
-            self.log.debug('Sending transfer request for download %s' % serverpath)
+            self.log.debug('Sending transfer request for download: %s' % unicode(transfer))
             # Don't need to utf encode this because hash is always hexadecimal
             tlssocket.send("TRANSFER %s\04" % hash)
             sock.settimeout(None)
-            success = True
-            self.log.info('Starting download of %s at offset %s' % (serverpath, offset))
+            self.log.debug('Opening file for download: %s' % unicode(transfer))
+            if needtocheck:
+                fil = file(hostpathwpf,'rb')
+                fil.seek(offset)
+                checkbuffer = fil.read()
+                fil.close()
+            fil = file(hostpathwpf,'a+b')
+            self.log.info('Starting download of %s at offset %s' % (unicode(transfer), offset))
             transfer.starttime = time.time()
             while not tlssocket.closed and fil.tell() < filsize and not transfer.stop:
-                data = tlssocket.recv(self.buffersize)
+                data = tlssocket.recv(buffersize)
+                if needtocheck:
+                    checkdata += data
+                    if len(checkdata) < len(checkbuffer):
+                        continue
+                    if checkdata[:len(checkbuffer)] != checkbuffer:
+                        self.log.error('Host file is not a partial file of server file, will attempt to redownload: %s' % unicode(transfer))
+                        if fil.tell() > 1048576:
+                            fil.seek(-1048576,2)
+                        else:
+                            fil.seek(0)
+                        newname = '%s.%s.wfd' % (hostpath, sha.new(fil.read()).hexdigest())
+                        fil.close()
+                        os.rename(hostpathwpf, newname)
+                        self.currentdownloads[serverpath].offset = 0
+                        raise TLSError
+                    data = checkdata[len(checkbuffer):]
+                    checkdata = None
+                    needtocheck = False
                 fil.write(data)
                 transfer.fileposition = fil.tell()
-            self.log.info('Finished downloading %s' % serverpath)
+            success = True
+            self.log.info('Finished downloading: %s' % unicode(transfer))
+            fil.close()
+            os.rename(hostpathwpf, hostpath)
         except (socket.error, TLSError, ValueError):
             self.log.error("Download connection closed: %s %s %s" % sys.exc_info())
-            success = False
+            attemptagain = True
         except:
-            self.log.error("Serious error in _sendfile thread: %s %s %s" % sys.exc_info())
-            success = False
-        if not tlssocket.closed:
-            tlssocket.close()
-        sock.close()
-        fil.close()
+            self.log.error("Serious error in _receivefile thread: %s %s %s" % sys.exc_info())
+        tlssocket = None
+        sock = None
+        fil = None
         self.acquirelock(True)
+        if serverpath in self.currentdownloads:
+            if attemptagain:
+                curtime = time.time()
+                errortime = curtime - transfer.errortimes.pop(0)
+                transfer.errortimes.append(curtime)
+                if errortime < self.errortimeout:
+                    self.log.info("Many recurrent errors downloading in a short period, skipping download: %s" % unicode(transfer))
+                else:
+                    self.downloadqueue.append(self.currentdownloads[serverpath])
+            del self.currentdownloads[serverpath]
         if 'downloadfinished' in self.callbacks:
             self.callbacks['downloadfinished'](self, transfer, success)
-        if success and serverpath in self.currentdownloads:
-            del self.currentdownloads[serverpath]
-        else:
-            curtime = time.time()
-            errortime = curtime - transfer.errortimes.pop(0)
-            transfer.errortimes.append(curtime)
-            if errortime < 120 and self.downloadqueue != [] and \
-               self.downloadqueue[-1].hostpath == hostpath:
-                self.log.info("Many recurrent errors downloading in a short period, skipping download of %s" % hostpath)
-            else:
-                self.downloadqueue.append(self.currentdownloads[serverpath])
-                del self.currentdownloads[serverpath]
-        if not self.tlssocket.closed:
-            # If the control connection is still open, might as well try to get
-            # the next file (or this one again if it didn't finish properly)
-            try:
-                self._get()
-            except (ValueError, socket.error, TLSError):
-                pass
+        self._get()
         self.releaselock(True)
         return 0
         
@@ -831,7 +941,7 @@ class wire:
         self.requested = {'accountlist':False, 'grouplist':False, 'pong':False,
             'readuser':[], 'readgroup':[], 'news':False, 'filelists':[],
             'searchlists':[], 'fileinfo':[], 'privatechat':0, 'userinfo':[],
-            'userlist':[], 'privileges':False, 'uploads':[], 'downloads':[]}
+            'userlist':[], 'uploads':[], 'downloads':[]}
         
     def _send(self, data):
         """Send a command to the Wired server
@@ -855,10 +965,12 @@ class wire:
         hash (str) - the hash corresponding to this transfer request
         """
         # See comments in receive file, as these operate similarly
+        sock, tlssocket = None, None
+        success, attemptagain = False, False
         hostpath, serverpath = transfer.hostpath, transfer.serverpath
         buffersize = self.buffersize
         filsize = os.path.getsize(hostpath)
-        self.log.debug('Opening file for upload %s' % hostpath)
+        self.log.debug('Opening file for upload: %s' % unicode(transfer))
         fil = file(hostpath,'rb')
         fil.seek(int(offset))
         self.log.debug('Connecting to transfer socket')
@@ -868,57 +980,45 @@ class wire:
             sock.connect((self.host,self.port+1))
             tlssocket = TLSConnection(sock)
             tlssocket.handshakeClientCert()
-            self.log.debug('Sending transfer request for upload %s' % hostpath)
+            self.log.debug('Sending transfer request for upload: %s' % unicode(transfer))
             tlssocket.send("TRANSFER %s\04" % hash)
             sock.settimeout(None)
-            success = True
-            self.log.info('Starting upload of %s at offset %s' % (hostpath, offset))
+            self.log.info('Starting upload of %s at offset %s' % (unicode(transfer), offset))
             transfer.starttime = time.time()
             while not tlssocket.closed and fil.tell() < filsize and not transfer.stop:
                 tlssocket.send(fil.read(self.buffersize))
                 transfer.fileposition = fil.tell()
             if serverpath not in self.files:
                 self.files[serverpath] = wirepath(serverpath, 0, filsize)
-            else:
-                self.getfileinfo(serverpath)
-            self.log.info('Finished uploading %s' % hostpath)
+            success = True
+            self.log.info('Finished uploading: %s' % unicode(transfer))
         except (socket.error, TLSError, ValueError):
             self.log.error("Upload connection closed: %s %s %s" % sys.exc_info())
-            self.getfileinfo(serverpath)
-            success = False
+            attemptagain = True
         except:
             self.log.error("Serious error in _sendfile thread: %s %s %s" % sys.exc_info())
-            self.getfileinfo(serverpath)
-            success = False
-        if not tlssocket.closed:
-            tlssocket.close()
-        sock.close()
+        tlssocket = None
+        sock = None
         fil.close()
         self.acquirelock(True)
+        if serverpath in self.currentuploads:
+            if attemptagain:
+                curtime = time.time()
+                errortime = curtime - transfer.errortimes.pop(0)
+                transfer.errortimes.append(curtime)
+                if errortime < self.errortimeout:
+                    self.log.info("Many recurrent errors uploading in a short period, skipping upload: %s" % unicode(transfer))
+                else:
+                    self.uploadqueue.append(self.currentuploads[serverpath])
+            del self.currentuploads[serverpath]
         if 'uploadfinished' in self.callbacks:
             self.callbacks['uploadfinished'](self, transfer, success)
-        if success and serverpath in self.currentuploads:
-            del self.currentuploads[serverpath]
-        else:
-            curtime = time.time()
-            errortime = curtime - transfer.errortimes.pop(0)
-            transfer.errortimes.append(curtime)
-            if errortime < 120 and self.uploadqueue != [] and \
-               self.uploadqueue[-1].hostpath == hostpath:
-                self.log.info("Many recurrent errors uploading in a short period, skipping upload of %s" % transfer.hostpath)
-            else:
-                self.uploadqueue.insert(0,self.currentuploads[serverpath])
-                del self.currentuploads[serverpath]
-        if not self.tlssocket.closed:
-            try:
-                self._put()
-            except (ValueError, socket.error, TLSError):
-                pass
+        self._put()
         self.releaselock(True)
         return 0
         
     ### Utility Functions
-    
+       
     def acquirelock(self, lock = True):
         """Acquire the lock if argument is True"""
         # Python thread doesn't support conditionally acquiring the lock based
@@ -927,6 +1027,12 @@ class wire:
         if lock:
             self.lock.acquire()
         return 0
+        
+    def validchat(self, chatid):
+        """Return True if chatid in chats, otherwise return False"""
+        if chatid in self.chats:
+            return True
+        return False
     
     def clearuploadqueue(self, lock = True):
         """Clear the upload queue"""
@@ -957,6 +1063,25 @@ class wire:
         for fil in [f for f in self.filelists if f.startswith(path)]:
             del self.filelists[fil]
         self.releaselock(lock)
+        return 0
+        
+    def loadconfig(self, config, **kwargs):
+        """Get configuration from file or keyword arguments
+        
+        config (str) - path to configuration file
+        **kwargs - other keyword arguments that override the defaults and the
+            values in config"""
+        if config != '':
+            rcp = RawConfigParser()
+            rcp.read(config)
+            if rcp.has_section('wire'):
+                for key, value in [(key, value) for (key, value) in rcp.items('wire') if key not in kwargs]:
+                    kwargs[key] = value
+        for key, value in [(key, value) for (key, value) in kwargs.items() if key in dir(self)]:
+            if isinstance(self.__dict__[key], int):
+                self.__dict__[key] = int(value)
+            else:
+                self.__dict__[key] = value
         return 0
         
     def normpaths(self, hostpath, serverpath):
@@ -1103,10 +1228,11 @@ class wire:
         icon (int) - icon number to which to change
         """
         self.acquirelock(lock)
+        failure = True
         self.log.info('Changing icon to %s' % icon)
-        self._send("ICON %s\04" % icon)
+        failure = self._send("ICON %s\04" % icon)
         self.releaselock(lock)
-        return 0
+        return int(failure)
 
     def changenick(self, nick, lock = True):
         """Change nick
@@ -1114,10 +1240,11 @@ class wire:
         nick (str) - nick to which to change
         """
         self.acquirelock(lock)
+        failure = True
         self.log.info('Changing nick to %s' % nick)
-        self._send("NICK %s\04" % nick)
+        failure = self._send("NICK %s\04" % nick)
         self.releaselock(lock)
-        return 0
+        return int(failure)
         
     def connect(self, lock = True):
         """Connect to the Wired Server"""
@@ -1145,7 +1272,7 @@ class wire:
             osname = '%s; Unknown; Unknown' % sys.platform
         self.clientversionstring = "%s (%s) %s" % (self.appname, osname, libversion)
         # Determine password hash and connect 
-        if self.password != '':
+        if not self.usepasswordhash and self.password != '':
             self.passwordhash = sha.new(self.password.encode('utf8','ignore')).hexdigest()
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1157,8 +1284,8 @@ class wire:
             self.connectionresponse = self.tlssocket.recv(self.buffersize)
             if self.connectionresponse[:3] != '200':
                 self.log.error('You have been banned from %s' % self.host)
+                self.tlssocket =  None
                 self.socket = None
-                self.tlssocket = None
                 self.releaselock(lock)
                 return 1
             self.log.info('Connected to %s' % self.host)
@@ -1174,8 +1301,8 @@ class wire:
             self.loginresponse = self.tlssocket.recv(self.buffersize)
             if self.loginresponse[:3] != '201':
                 self.log.error('Login as %s not successful' % self.login)
+                self.tlssocket =  None
                 self.socket = None
-                self.tlssocket = None
                 self.releaselock(lock)
                 return 1
             self.log.info('Logged into %s as %s' % (self.host, self.login))
@@ -1184,6 +1311,8 @@ class wire:
             self.getuserlist(1, False)
         except (socket.error, TLSError, ValueError):
             self.log.error("Couldn't connect or login to server: %s %s %s" % sys.exc_info())
+            self.tlssocket =  None
+            self.socket = None
             self.releaselock(lock)
             return 1
         self.releaselock(lock)
@@ -1194,16 +1323,11 @@ class wire:
     def getprivileges(self, lock = True):
         """Get privileges for this connection"""
         self.acquirelock(lock)
-        success = True
-        if not self.requested['privileges']:
-            self.requested['privileges'] = True
-            self.log.info('Requesting privileges')
-            self._send("PRIVILEGES\04")
-        else:
-            self.log.warning('Already requested privileges')
-            success = False
+        failure = True
+        self.log.info('Requesting privileges')
+        failure = self._send("PRIVILEGES\04")
         self.releaselock(lock)
-        return 0
+        return int(failure)
         
     ## Account Functions
     
@@ -1216,13 +1340,18 @@ class wire:
         privileges (wireprivileges) - privileges for account
         """
         self.acquirelock(lock)
+        if name in self.accounts:
+            self.log.error('That user account you provided already exists')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.createaccounts:
-            self.log.info('Creating new user: %s' % name)
-            self._send("CREATEUSER %s\x1c%s\x1c%s\x1c%s\04" % (name, password, group, privileges))
+            self.log.info('Creating new user account: %s' % name)
+            failure = self._send("CREATEUSER %s\x1c%s\x1c%s\x1c%s\04" % (name, password, group, privileges))
         else:
-            self.log.warning('You don\'t have the privileges to create a new account')
+            self.log.warning('You don\'t have the privileges to create an account')
         self.releaselock(lock)
-        return int(not self.privileges.createaccounts)
+        return int(failure)
         
     def creategroup(self, name, privileges, lock = True):
         """Create a new group
@@ -1231,13 +1360,18 @@ class wire:
         privileges (wireprivileges) - privileges for group
         """
         self.acquirelock(lock)
+        if name in self.groups:
+            self.log.error('That group account already exists')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.createaccounts:
-            self.log.info('Creating new group: %s' % name)
-            self._send("CREATEGROUP %s\x1c%s\04" % (name, privileges))
+            self.log.info('Creating new group account: %s' % name)
+            failure = self._send("CREATEGROUP %s\x1c%s\04" % (name, privileges))
         else:
-            self.log.warning('You don\'t have the privileges to create a group')
+            self.log.warning('You don\'t have the privileges to create a group account')
         self.releaselock(lock)
-        return int(not self.privileges.createaccounts)
+        return int(failure)
         
     def deleteaccount(self, name, lock = True):
         """Delete a user account
@@ -1245,13 +1379,18 @@ class wire:
         name (str) - name of account to delete
         """
         self.acquirelock(lock)
+        if name not in self.accounts:
+            self.log.error('You did not provide a valid account')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.deleteaccounts:
-            self.log.info('Deleting user: %s' % name)
-            self._send("DELETEUSER %s\04" % name)
+            self.log.info('Deleting user account: %s' % name)
+            failure = self._send("DELETEUSER %s\04" % name)
         else:
-            self.log.warning('You don\'t have the privileges to delete an account')
+            self.log.warning('You don\'t have the privileges to delete accounts')
         self.releaselock(lock)
-        return int(not self.privileges.deleteaccounts)
+        return int(failure)
         
     def deletegroup(self, name, lock = True):
         """Delete a group
@@ -1259,60 +1398,72 @@ class wire:
         name (str) - name of group to delete
         """
         self.acquirelock(lock)
+        if name not in self.groups:
+            self.log.error('You did not provide a valid group account')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.deleteaccounts:
-            self.log.info('Deleting group: %s' % name)
-            self._send("DELETEGROUP %s\04" % name)
+            self.log.info('Deleting group account: %s' % name)
+            failure = self._send("DELETEGROUP %s\04" % name)
         else:
-            self.log.warning('You don\'t have the privileges to delete an account')
+            self.log.warning('You don\'t have the privileges to delete accounts')
         self.releaselock(lock)
-        return int(not self.privileges.deleteaccounts)
+        return int(failure)
         
-    def editaccount(self, account, lock = True):
+    def editaccount(self, name, lock = True):
         """Edit a user account specification
         
-        account (wireaccount) - update the server using the information in this
-            account
+        name - update the server using the information in this account
         """
         self.acquirelock(lock)
+        if name not in self.accounts or self.accounts[name] == None:
+            self.log.error('You did not provide a valid account')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.editaccounts:
-            self.log.info('Editing user account: %s' % account.name)
-            self._send("EDITUSER %s\04" % unicode(account))
+            self.log.info('Editing user account: %s' % name)
+            failure = self._send("EDITUSER %s\04" % unicode(self.accounts[name]))
         else:
-            self.log.warning('You don\'t have the privileges to edit users')
+            self.log.warning("You don't have the privileges to edit users")
         self.releaselock(lock)
-        return int(not self.privileges.editaccounts)
+        return int(failure)
         
-    def editgroup(self, account, lock = True):
+    def editgroup(self, name, lock = True):
         """Edit a group account specification
 
-        account (wireaccount) - update the server using the information in this
-            group account
+        name - update the server using the information in this group account
         """
         self.acquirelock(lock)
+        if name not in self.groups or self.groups[name] == None:
+            self.log.error('You did not provide a valid group account')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.editaccounts:
-            self.log.info('Editing group account: %s' % account.name)
-            self._send("EDITGROUP %s\04" % unicode(account))
+            self.log.info('Editing group account: %s' % name)
+            failure = self._send("EDITGROUP %s\04" % unicode(self.groups[name]))
         else:
             self.log.warning('You don\'t have the privileges to edit groups')
         self.releaselock(lock)
-        return int(not self.privileges.editaccounts)
+        return int(failure)
         
     def getaccounts(self, lock = True):
         """Get a list of user accounts"""
         self.acquirelock(lock)
-        success = False
+        failure = True
         if self.privileges.editaccounts and not self.requested['accountlist']:
             self.log.info('Getting list of user accounts')
             self.requested['accountlist'] = True
             self.accounts = {}
-            self._send("USERS\04")
-            success = True
+            failure = self._send("USERS\04")
         elif self.requested['accountlist']:
             self.log.warning('You already have an outstanding request for the list of user accounts')
         else:
             self.log.warning('You don\'t have the privileges to get a list of user accounts')
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def getaccountspec(self, name, lock = True):
         """Get account specification for user
@@ -1320,35 +1471,37 @@ class wire:
         name (str) - name of account for which to get specification
         """
         self.acquirelock(lock)
-        success = False
+        if name not in self.accounts:
+            self.log.error('You did not provide a valid group account')
+            self.releaselock(lock)
+            return 1
+        failure = True 
         if self.privileges.editaccounts and name not in self.requested['readuser']:
             self.log.info('Requesting spec for user: %s' % name)
             self.requested['readuser'].append(name)
-            self._send("READUSER %s\04" % name)
-            success = True
+            failure = self._send("READUSER %s\04" % name)
         elif name in self.requested['readuser']:
             self.log.warning('You already have an outstanding request for a spec for this user')
         else:
             self.log.warning('You don\'t have the privileges to get a user specification')
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def getgroups(self, lock = True):
         """Get a list of user groups"""
         self.acquirelock(lock)
-        success = False
+        failure = True
         if self.privileges.editaccounts and not self.requested['grouplist']:
             self.groups = {}
             self.log.info('Getting list of user groups')
             self.requested['grouplist'] = True
-            self._send("GROUPS\04")
-            success = True
+            failure = self._send("GROUPS\04")
         elif self.requested['grouplist']:
             self.log.warning('You already have an outstanding request for the list of group accounts')
         else:
             self.log.warning('You don\'t have the privileges to get a list of group accounts')
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def getgroupspec(self, name, lock = True):
         """Get account specification for group
@@ -1356,32 +1509,40 @@ class wire:
         name (str) - name of group account for which to get specification
         """
         self.acquirelock(lock)
-        success = False
+        if name not in self.groups:
+            self.log.error('You did not provide a valid group account')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.editaccounts and name not in self.requested['readgroup']:
             self.log.info('Requesting spec for group: %s' % name)
             self.requested['readgroup'].append(name)
-            self._send("READGROUP %s\04" % name)
-            success = True
+            failure = self._send("READGROUP %s\04" % name)
         elif name in self.requested['readgroup']:
             self.log.warning('You already have an outstanding request for a spec for this group')
         else:
             self.log.warning('You don\'t have the privileges to get a group specification')
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     ## Chat Functions
     
     def actionchatmessage(self, chatid, message, lock = True):
         """Send an action message to a chat
         
-        chatid (int) - id of chat to which to send message
+        chat (int) - id of chat to which to send message
         message (str) - action chat message to send
         """
         self.acquirelock(lock)
+        if not self.validchat(chatid):
+            self.log.error('You are not currently in that chat')
+            self.releaselock(lock)
+            return 1
+        failure = True
         self.log.info('Sending action message to chat %s: %s' % (chatid, message))
-        self._send("ME %s\x1c%s\04" % (chatid, message))
+        failure = self._send("ME %s\x1c%s\04" % (chatid, message))
         self.releaselock(lock)
-        return 0
+        return int(failure)
 
     def broadcast(self, message, lock = True):
         """Send a message to all users
@@ -1389,13 +1550,14 @@ class wire:
         message (str) - broadcast message to send
         """
         self.acquirelock(lock)
+        failure = True
         if self.privileges.broadcast:
             self.log.info('Sending broadcast message: %s' % message)
-            self._send("BROADCAST %s\04" % message)
+            failure = self._send("BROADCAST %s\04" % message)
         else:
             self.log.warning('You don\'t have the privileges to send a broadcast message')
         self.releaselock(lock)
-        return int(not self.privileges.broadcast)
+        return int(failure)
         
     def chatmessage(self, chatid, message, lock = True):
         """Send a message to a chat
@@ -1404,19 +1566,25 @@ class wire:
         message (str) - broadcast message to send
         """
         self.acquirelock(lock)
+        if not self.validchat(chatid):
+            self.log.error('You are not currently in that chat')
+            self.releaselock(lock)
+            return 1
+        failure = True
         self.log.info('Sending message to chat %s: %s' % (chatid, message))
-        self._send("SAY %s\x1c%s\04" % (chatid, message))
+        failure = self._send("SAY %s\x1c%s\04" % (chatid, message))
         self.releaselock(lock)
-        return 0
+        return int(failure)
         
     def createprivatechat(self, lock = True):
         """Create a private chat"""
         self.acquirelock(lock)
+        failure = True
         self.requested['privatechat'] += 1
         self.log.info('Creating Private Chat')
-        self._send("PRIVCHAT\04")
+        failure = self._send("PRIVCHAT\04")
         self.releaselock(lock)
-        return 0
+        return int(failure)
         
     def declineprivatechat(self, chatid, lock = True):
         """Decline a private chat
@@ -1424,11 +1592,12 @@ class wire:
         chatid (int) - id of chat to which to decline joining
         """
         self.acquirelock(lock)
+        failure = True
         self.log.info('Declining private chat %s' % chatid)
-        self._send("DECLINE %s\04" % chatid)
+        failure = self._send("DECLINE %s\04" % chatid)
         del self.privatechatinvites[chatid]
         self.releaselock(lock)
-        return 0
+        return int(failure)
         
     def getuserlist(self, chatid, lock = True):
         """Get userlist for chat
@@ -1437,18 +1606,17 @@ class wire:
         """
         self.acquirelock(lock)
         chatid = int(chatid)
-        success = True
+        failure = True
         if chatid not in self.requested['userlist']:
             # create or empty the list of users for this chat
             self.chats[chatid] = []
             self.requested['userlist'].append(chatid)
             self.log.info('Requesting User list for chat %s' % chatid)
-            self._send("WHO %s\04" % chatid)
+            failure = self._send("WHO %s\04" % chatid)
         else:
             self.log.warning('You already have or have requested the list of users for this chat')
-            success = False
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def inviteuser(self, user, chatid, lock = True):
         """Inivite a user to a private chat
@@ -1458,17 +1626,20 @@ class wire:
         """
         self.acquirelock(lock)
         userid = self.userid(user)
-        success = False
+        if not self.validchat(chatid) or userid == None:
+            self.log.error('You are not currently in that chat, or that user is not currently on the server')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if chatid == 1:
             self.log.warning('Can\'t invite users to the public chat')
         elif chatid not in self.chats:
             self.log.warning('Can\'t invite users to a chat in which you are not present')
         else:
             self.log.info('Iniviting %s to chat %s' % (self.users[userid].nick, chatid))
-            self._send("INVITE %s\x1c%s\04" % (userid, chatid))
-            success = True
+            failure = self._send("INVITE %s\x1c%s\04" % (userid, chatid))
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def joinprivatechat(self, chatid, lock = True):
         """Join a private chat
@@ -1476,12 +1647,13 @@ class wire:
         chatid (int) - id of chat to which to join
         """
         self.acquirelock(lock)
+        failure = True
         self.log.info('Joining private chat %s' % chatid)
-        self._send("JOIN %s\04" % chatid)
-        self.getuserlist(chatid, False)
+        if not self._send("JOIN %s\04" % chatid):
+            failure = self.getuserlist(chatid, False)
         del self.privatechatinvites[chatid]
         self.releaselock(lock)
-        return 0
+        return int(failure)
 
     def leavechat(self, chatid, lock = True):
         """Leave a chat
@@ -1489,11 +1661,16 @@ class wire:
         chatid (int) - id of chat to which to leave
         """
         self.acquirelock(lock)
+        if not self.validchat(chatid):
+            self.log.error('You are not currently in that chat')
+            self.releaselock(lock)
+            return 1
+        failure = True
         self.log.info('Leaving chat %s' % chatid)
         for userid in self.chats[chatid]:
             self.log.debug('Removing chat %s from user %s' % (chatid, userid))
             self.users[userid].removechat(chatid)
-        self._send("LEAVE %s\04" % chatid)
+        failure = self._send("LEAVE %s\04" % chatid)
         self.log.debug('Removing chat %s' % chatid)
         del self.chats[chatid]
         if chatid == 1:
@@ -1501,13 +1678,15 @@ class wire:
             # it a leave message with a chatid of 1, but you should only be 
             # doing this if you want to leave the server
             self.log.info('Left public chat, disconnecting from server')
-            try:
-                self.tlssocket.close()
-            except SyntaxError:
-                pass
-            self.socket.close()
+            if self.tlssocket != None:
+                try:
+                    self.tlssocket.close()
+                except (socket.error, TLSError, ValueError):
+                    pass
+                self.tlssocket = None
+            self.socket = None
         self.releaselock(lock)
-        return 0
+        return int(failure)
         
     def privatemessage(self, user, message, lock = True):
         """Send a private message to a user
@@ -1517,10 +1696,15 @@ class wire:
         """
         self.acquirelock(lock)
         userid = self.userid(user)
+        if userid == None:
+            self.log.error('That user is not currently on the server')
+            self.releaselock(lock)
+            return 1
+        failure = True
         self.log.info('Sending message to %s: %s' % (self.users[userid].nick, message))
-        self._send("MSG %s\x1c%s\04" % (userid, message))
+        failure = self._send("MSG %s\x1c%s\04" % (userid, message))
         self.releaselock(lock)
-        return 0
+        return int(failure)
         
     ## File Functions
     
@@ -1547,8 +1731,7 @@ class wire:
             if serverdir in self.filelists:
                 self.filelists[path]['freeoctets'] = self.filelists[serverdir]['freeoctets']
             self.log.info('Creating new folder: %s' % path)
-            self._send("FOLDER %s\04" % path)
-            failure = False
+            failure = self._send("FOLDER %s\04" % path)
         self.releaselock(lock)
         return int(failure)
         
@@ -1558,14 +1741,15 @@ class wire:
         path (str) - path to delete, all deletes are recursive
         """
         self.acquirelock(lock)
+        failure = True
         if self.privileges.deletefiles:
             self.log.info('Deleting path: %s' % path)
             self.forgetpath(path, False)
-            self._send("DELETE %s\04" % path)
+            failure = self._send("DELETE %s\04" % path)
         else:
             self.log.warning('You don\'t have the privileges to delete files/folders')
         self.releaselock(lock)
-        return int(not self.privileges.deletefiles)
+        return int(failure)
         
     def download(self, serverpath, hostpath, lock = True):
         """Add a file or folder to the upload queue
@@ -1584,8 +1768,7 @@ class wire:
         else:
             self.log.info('Adding %s to download queue' % serverpath)
             self.downloadqueue.insert(0,wiredownload(serverpath,hostpath))
-            self._get()
-            failure = False
+            failure = self._get()
         self.releaselock(lock)
         return int(failure)
         
@@ -1595,16 +1778,15 @@ class wire:
         path (str) - path about which to get info
         """
         self.acquirelock(lock)
-        success = True
+        failure = True
         if path not in self.requested['fileinfo']:
             self.requested['fileinfo'].append(path)
             self.log.info('Requesting info for %s' % path)
-            self._send("STAT %s\04" % path)
+            failure = self._send("STAT %s\04" % path)
         else:
             self.log.debug('Already getting info for that file')
-            success = False
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def getfilelist(self, path, lock = True):
         """Get filelist for path"""
@@ -1617,8 +1799,7 @@ class wire:
             else:
                 self.filelists[path]['revision'] += 1
             self.log.info('Requesting file list for %s' % path)
-            self._send("LIST %s\04" % path)
-            failure = False
+            failure = self._send("LIST %s\04" % path)
         else:
             self.log.warning('You already have an outstanding request to get this filelist')
         self.releaselock(lock)
@@ -1631,14 +1812,15 @@ class wire:
         pathto (str) - location to which to move path
         """
         self.acquirelock(lock)
+        failure = True
         if self.privileges.movefiles:
             self.log.info('Moving path %s to %s' % (pathfrom, pathto))
             self.forgetpath(pathfrom, False)
-            self._send("MOVE %s\x1c%s\04" % (pathfrom, pathto))
+            failure = self._send("MOVE %s\x1c%s\04" % (pathfrom, pathto))
         else:
             self.log.warning('You don\'t have the privileges to move files/folders')
         self.releaselock(lock)
-        return int(not self.privileges.movefiles)
+        return int(failure)
         
     def searchfiles(self, query, lock = True):
         """Search for files with names containing query
@@ -1647,17 +1829,16 @@ class wire:
             this query as a substring, I think)
         """
         self.acquirelock(lock)
-        success = True
+        failure = True
         if query not in self.requested['searchlists']:
             self.requested['searchlists'].append(query)
             self.log.info('Searching for paths containing %s' % query)
             self.searches[query] = {}
-            self._send("SEARCH %s\04" % query)
+            failure = self._send("SEARCH %s\04" % query)
         else:
             self.log.debug('Already searching with that query')
-            success = False
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def upload(self, hostpath, serverpath, lock = True):
         """Add a file or folder to the upload queue
@@ -1676,8 +1857,7 @@ class wire:
         else:
             self.log.info('Adding %s to upload queue' % hostpath)
             self.uploadqueue.insert(0,wireupload(hostpath, serverpath))
-            self._put()
-            failure = False
+            failure = self._put()
         self.releaselock(lock)
         return int(failure)
         
@@ -1686,30 +1866,30 @@ class wire:
     def clearnews(self, lock = True):
         """Clear the news"""
         self.acquirelock(lock)
+        failure = True
         if self.privileges.clearnews:
             self.log.info('Clearing the news')
-            self._send("CLEARNEWS\04")
+            failure = self._send("CLEARNEWS\04")
             self.news = []
         else:
             self.log.warning('You don\'t have the privilages to clear the news')
         self.releaselock(lock)
-        return int(not self.privileges.clearnews)
+        return int(failure)
         
     def getnews(self, lock = True):
         """Get news"""
         self.acquirelock(lock)
-        success = True
+        failure = True
         if not self.requested['news']:
             self.requested['news'] = True
             self.log.info('Requesting news')
             # Empty the news so no duplicates appear
             self.news = []
-            self._send("NEWS\04")
+            failure = self._send("NEWS\04")
         else:
             self.log.debug('Already requested news')
-            success = False
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
         
     def postnews(self, message, lock = True):
         """Post a new news article
@@ -1717,13 +1897,14 @@ class wire:
         message (str) - message to post to the news
         """
         self.acquirelock(lock)
+        failure = True
         if self.privileges.postnews:
             self.log.info('Posting a new news article: %s' % message)
-            self._send("POST %s\04" % message)
+            failure = self._send("POST %s\04" % message)
         else:
             self.log.warning('You don\'t have the privileges to post to the news')
         self.releaselock(lock)
-        return int(not self.privileges.postnews)
+        return int(failure)
         
     ## User Functions
 
@@ -1733,18 +1914,21 @@ class wire:
         user - user about which to get info"""
         self.acquirelock(lock)
         userid = self.userid(user)
-        success = False
+        if userid == None:
+            self.log.error('That user is not currently on the server')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.getuserinfo and userid not in self.requested['userinfo']:
             self.requested['userinfo'].append(userid)
             self.log.info('Getting info for %s' % self.users[userid].nick)
-            self._send("INFO %s\04" % userid)
-            success = True
+            failure = self._send("INFO %s\04" % userid)
         elif userid in self.requested['userinfo']:
             self.log.warning('You already have an outstanding request for this user\'s info')
         else:
             self.log.warning('You don\'t have the privileges to get info on users')
         self.releaselock(lock)
-        return int(not success)
+        return int(failure)
 
     def kickuser(self, user, message, lock = True):
         """Kick a user
@@ -1754,13 +1938,18 @@ class wire:
         """
         self.acquirelock(lock)
         userid = self.userid(user)
+        if userid == None:
+            self.log.error('That user is not currently on the server')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.kickusers:
             self.log.info('Kicking user %s with comment: %s' % (self.users[userid].nick, message))
-            self._send("KICK %s\x1c%s\04" % (userid, message))
+            failure = self._send("KICK %s\x1c%s\04" % (userid, message))
         else:
             self.log.warning('You don\'t have the privileges to kick users')
         self.releaselock(lock)
-        return int(not self.privileges.kickusers)
+        return int(failure)
         
     def banuser(self, user, message, lock = True):
         """Ban a user temporarily
@@ -1770,13 +1959,18 @@ class wire:
         """
         self.acquirelock(lock)
         userid = self.userid(user)
+        if userid == None:
+            self.log.error('That user is not currently on the server')
+            self.releaselock(lock)
+            return 1
+        failure = True
         if self.privileges.banusers:
             self.log.info('Banning user %s with comment: %s' % (self.users[userid].nick, message))
-            self._send("BAN %s\x1c%s\04" % (userid, message))
+            failure = self._send("BAN %s\x1c%s\04" % (userid, message))
         else:
             self.log.warning('You don\'t have the privileges to kick users')
         self.releaselock(lock)
-        return int(not self.privileges.banusers)
+        return int(failure)
         
     ### Called on responses from server
     
@@ -1945,10 +2139,12 @@ class wire:
                 else:
                     self.log.warning('Got userlist for private chat %s with unknown user id: %s' % (args, userid))
                     return 1
-            self.log.debug('Adding chat %s to user %s' % (chatid,userid))
-            self.users[userid].addchat(chatid)
-            self.log.debug('Adding user %s to chat %s' % (userid,chatid))
-            self.chats[chatid].append(userid)
+            if chatid not in self.users[userid].chats:
+                self.log.debug('Adding chat %s to user %s' % (chatid,userid))
+                self.users[userid].addchat(chatid)
+            if userid not in self.chats[chatid]:
+                self.log.debug('Adding user %s to chat %s' % (userid,chatid))
+                self.chats[chatid].append(userid)
             return 0
         self.log.warning('Received unrequested userlist')
         return 1
@@ -2047,7 +2243,7 @@ class wire:
         elif path in self.currentuploads:
             self.log.info('Your upload of "%s" is at position %s in the queue' % (path, args[1]))
         else:
-            self.log.warning('Received transfer ready for unrequested transfer')
+            self.log.warning('Received transfer queued for unrequested transfer')
             return 1
         return 0
             
@@ -2260,16 +2456,9 @@ class wire:
         
     def gotprivileges(self,args):
         """Received privileges for this connection (602)"""
-        # I think the server might send this mask if you edit your own account
-        # or group spec, but I'm not sure.  If that is the case,
-        # self.requested['privileges'] has to be removed
-        if self.requested['privileges']:
-            self.log.debug('Got privileges for this connection')
-            self.privileges.update(args)
-            self.requested['privileges'] = False
-            return 0
-        self.log.warning('Received privileges without requesting them')
-        return 1
+        self.log.debug('Got privileges for this connection')
+        self.privileges.update(args)
+        return 0
         
     def gotaccountlist(self,args):
         """Received account name (610)"""

@@ -72,8 +72,13 @@ are necessary:
 The Code that does this is:
 
 import wire
-test = wire.wire(host='127.0.0.1') # Address of server
+test = wire.wire('wire.conf') # Configuration File
 test.connect()
+
+Alternatively, instead of passing a configuration file to the constructor, you 
+can pass individual keyword arguments (see the wire.conf file for which keyword
+arguments are accepted).  You can pass both a configuration file and keyword 
+arguments, and the keyword arguments will take precedence.
 
 After you have connected to the server, you can send any of the available 
 commands to get information from the server, such as:
@@ -133,6 +138,20 @@ Not much documentation is currently available.  I'm going to try to get an FAQ
 
 7 History
 ==========
+0.2 - 2004-08-01
+- Allow use of configuration file (with values overriden by keyword arguments)
+- Check that resumed download matches local file, instead of assuming it does
+- Save partial downloads as filename.wpf and only rename to filename if 
+  download is successful
+- Allow callables in upload and download queues
+- Add ability use given password hash instead of calculating one
+- Many stability improvements
+- Fix potential infinite loop when recurrent errors occur when uploading
+- Fix incomplete downloads when using savequeues inside downloadfinished or 
+  upload finished callbacks
+- Fix return codes on functions that send requests to server
+- Check that given chat, user, and account exist in related functions that send
+  requests to the server
 0.1 - 2004-07-26
 - Initial public release
 
