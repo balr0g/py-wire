@@ -1,0 +1,145 @@
+py-wire                             http://www.sourceforge.net/projects/pywire/
+===============================================================================
+
+Table of Contents
+==================
+1 Introduction
+2 License/Acknowledgments
+3 Installation
+4 Getting Started with the Library
+5 More Advanced Use of the Library
+6 Known Bugs
+7 History
+8 References
+
+1 Introduction
+===============
+
+py-wire is a pure Python library that implements the complete Wired 
+protocol.[1] All available commands can be sent and all return types in the 
+Wired RFC are recognized.  Both downloading and uploading files and entire 
+directories are fully supported.
+
+If you have any problems using this library, please post a bug report on 
+SourceForge.
+
+2 Licenses/Acknowledgments
+============================
+
+py-wire is released under the MIT License, which gives you freedom to do pretty
+much anything you want with it as long as you include a copy of the license.
+
+Thanks to Axel Andersson for his design of the Wired protocol and server.
+
+Thanks to Trevor Perrin for his TLS Lite library, as well as the structure of
+this README.
+
+3 Installation
+===============
+
+Requirements:
+  Python 2.3.3 or greater is recommended.[2]  I haven't done any testing on 
+  older versions of Python, but anything less than 2.2 definitely won't work, 
+  as list comprehensions are used.  Please post on SourceForge if you are able 
+  to successfully run it with an older version of Python. 
+  
+  TLS Lite 0.3.3 or greater is recommended.[3]  I haven't used any other 
+  versions, so I'm not sure if they work.
+  
+Options:
+  TLS Lite is a pure Python library, and the encryption that Wired uses is very
+  processor intensive, so downloads and uploads will be very slow unless you 
+  have an additional library containing native encryption code, such as 
+  M2Crypto, cryptlib_py, or pycrypto (recommended).  pycrypto is available in 
+  both source[4] and Windows binary format.[5]
+  
+On Windows:
+  Run the Windows installer.
+
+Anywhere else:
+  Run 'setup.py install'.
+  	
+4 Getting Started with the Library
+===================================
+
+The library is designed to be fairly easy to use.  The following three steps 
+are necessary:
+
+1) Import the library
+2) Instantiate a new wire object
+3) Connect to a server
+
+The Code that does this is:
+
+import wire
+test = wire.wire(host='127.0.0.1') # Address of server
+test.connect()
+
+After you have connected to the server, you can send any of the available 
+commands to get information from the server, such as:
+
+test.getnews()
+test.download('/path/to/file/or/directory/on/server', '/local/path')
+test.upload('/local/file/or/directory/to/upload', '/server/path')
+
+To get a list of all available functions and related data structures:
+
+help(wire)
+
+5 More Advanced Use of the Library
+===================================
+
+If you plan on writing non-trivial applications with py-wire, you aren't going 
+to just want to send commands.  You'll also want to be able to process the 
+servers response.  For example, if you are writing a GUI library and you 
+receive a private message, you are probably going to want to display that 
+message somewhere on the screen where the user can see it.  In order to do so, 
+you need to create a callback function and pass it to the library.  
+For example:
+
+1	def showprivatemessage(wireconn, args):
+2	# Include nice GUI code to print the message somewhere
+3	
+4	import wire
+5	test = wire.wire(host='127.0.0.1', callbacks = {305:showprivatemessage})
+6	test.connect()
+
+Some notes about the above process:
+Line 1: wireconn is the wire object that called this callback function
+		args is a list of arguments that the server provided with its message.
+		It's basically the server's response, less the first four characters
+		(the response code), less the last character, and split by the ASCII 
+		field separator (0x1C) into a list of strings.  In this case, args[0]
+		is the id of the user who sent the message, and args[1] is the message 
+		itself.
+		
+Line 5: callbacks are passed to the library as a dictionary with the key being
+        an integer representing the server's response code, and the value being
+		the function to call.
+		
+There are some noninteger key callbacks that the library uses in certain 
+circumstances, see help(wire) or the source code for more details.  Also, note
+that server responses are handled in a separate thread.
+
+6 Known Bugs
+=============
+Doesn't support anonymous ciphers (not supported by TLS Lite)
+Not all exceptions are caught.  If you find an uncaught exception, please post 
+    a description of the problem (including traceback) on SourceForge.
+Not much documentation is currently available.  I'm going to try to get an FAQ 
+	going on the public website, assuming anyone has questions to ask.
+	If there is a need, I'll create more structured documentation at a later
+	date.
+
+7 History
+==========
+0.1 - 2004-07-26
+- Initial public release
+
+8 References
+=============
+[1] http://www.zankasoftware.com/wired/rfc1.txt
+[2] http://www.python.org/
+[3] http://trevp.net/tlslite/
+[4] http://www.amk.ca/python/code/crypto.html
+[5] http://www.britishsteal.com/dist/

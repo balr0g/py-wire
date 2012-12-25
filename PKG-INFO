@@ -1,0 +1,18 @@
+Metadata-Version: 1.0
+Name: py-wire
+Version: 0.1
+Summary: Module for interacting with a Wired server
+Home-page: http://sourceforge.net/projects/pywire/
+Author: Quasi Reality
+Author-email: quasireality@users.sourceforge.net
+License: UNKNOWN
+Description: UNKNOWN
+Platform: UNKNOWN
+Classifier: Development Status :: 4 - Beta
+Classifier: Environment :: Other Environment
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Natural Language :: English
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python
+Classifier: Topic :: Communications :: BBS
