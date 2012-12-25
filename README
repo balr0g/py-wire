@@ -16,9 +16,9 @@ Table of Contents
 ===============
 
 py-wire is a pure Python library that implements the complete Wired 
-protocol.[1] All available commands can be sent and all return types in the 
-Wired RFC are recognized.  Both downloading and uploading files and entire 
-directories are fully supported.
+protocol, both 1.0[1] and 1.1[2]. All available commands can be sent and all 
+return types in the Wired RFCs are recognized.  Both downloading and uploading 
+files and entire directories are fully supported.
 
 If you have any problems using this library, please post a bug report on 
 SourceForge.
@@ -38,12 +38,12 @@ this README.
 ===============
 
 Requirements:
-  Python 2.3.3 or greater is recommended.[2]  I haven't done any testing on 
+  Python 2.3.3 or greater is recommended.[3]  I haven't done any testing on 
   older versions of Python, but anything less than 2.2 definitely won't work, 
   as list comprehensions are used.  Please post on SourceForge if you are able 
   to successfully run it with an older version of Python. 
   
-  TLS Lite 0.3.3 or greater is recommended.[3]  I haven't used any other 
+  TLS Lite 0.3.3 or greater is recommended.[4]  I haven't used any other 
   versions, so I'm not sure if they work.
   
 Options:
@@ -51,7 +51,7 @@ Options:
   processor intensive, so downloads and uploads will be very slow unless you 
   have an additional library containing native encryption code, such as 
   M2Crypto, cryptlib_py, or pycrypto (recommended).  pycrypto is available in 
-  both source[4] and Windows binary format.[5]
+  both source[5] and Windows binary format.[6]
   
 On Windows:
   Run the Windows installer.
@@ -138,6 +138,13 @@ Not much documentation is currently available.  I'm going to try to get an FAQ
 
 7 History
 ==========
+0.3 - 2004-08-14
+- Support Wired Protocol 1.1 (Wired RFC 2)
+- Keep track of server information (such as protocol version), and connection
+  state
+- Keep track of users who left the server (or were banned or kicked)
+- Add wirechat class, now that chats have some attributes worth storing
+- Fix an UnboundLocalError in wire.gotclientleave
 0.2.1 - 2004-08-02
 - Break connect function into smaller components, allowing for callbacks for
   gotserverinfo, gotloginsucceeded, gotbanned, and gotloginfailed
@@ -164,7 +171,8 @@ Not much documentation is currently available.  I'm going to try to get an FAQ
 8 References
 =============
 [1] http://www.zankasoftware.com/wired/rfc1.txt
-[2] http://www.python.org/
-[3] http://trevp.net/tlslite/
-[4] http://www.amk.ca/python/code/crypto.html
-[5] http://www.britishsteal.com/dist/
+[2] http://www.zankasoftware.com/wired/rfc2.txt
+[3] http://www.python.org/
+[4] http://trevp.net/tlslite/
+[5] http://www.amk.ca/python/code/crypto.html
+[6] http://www.britishsteal.com/dist/
