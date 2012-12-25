@@ -1,6 +1,6 @@
 from distutils.core import setup
 setup(name="py-wire",
-      version="0.3.2",
+      version="0.4",
       description="Module for interacting with a Wired server",
       author="Quasi Reality",
       author_email="quasireality@users.sourceforge.net",
