@@ -34,7 +34,7 @@ from tlslite import __version__ as tlsversion
 #import traceback
 from UserDict import DictMixin
 
-__version__ = '0.3.1'
+__version__ = '0.3.2'
 
 ## Default logger
 
@@ -791,6 +791,9 @@ class wire:
                 self.log.debug('Sending get message for transfer: %s' % unicode(download))
                 self.requested['downloads'].append(serverpath)
                 self.currentdownloads[serverpath] = self.downloadqueue.pop()
+                if self.currentdownloads[serverpath].serverfile is None and serverpath in self.files:
+                    self.currentdownloads[serverpath].serverfile = self.files[serverpath]
+                    self.currentdownloads[serverpath].size = self.files[serverpath].size
                 if self._send("GET %s\x1c%s\04" % (serverpath, download.offset)):
                     self.requested['downloads'].pop()
                     del self.currentdownloads[serverpath]
@@ -1139,7 +1142,7 @@ class wire:
         data (str) - data to send to the Wired server
         """
         self.log.debug('Sending command to server: %s' % data)
-        data = data.encode('utf-8')
+        data = data.encode('utf8')
         try:
             self.tlssocket.send(data)
         except (socket.error, TLSError, AttributeError, ValueError):
@@ -1584,6 +1587,14 @@ class wire:
                 pass
             self.tlssocket = None
         self.socket = None
+        for serverpath, download in self.currentdownloads.items():
+            if download.serverqueueposition == 0:
+                self.downloadqueue.append(download)
+                del self.currentdownloads[serverpath]
+        for serverpath, upload in self.currentuploads.items():
+            if upload.serverqueueposition == 0:
+                self.uploadqueue.append(upload)
+                del self.currentuploads[serverpath]
         self.releaselock(lock)
         return 0
         
@@ -2067,6 +2078,8 @@ class wire:
             self.log.warning("The folder you are are trying to download into doesn't exist")
         else:
             self.log.info('Adding %s to download queue' % serverpath)
+            if serverpath in self.files:
+                serverpath = self.files[serverpath]
             self.downloadqueue.insert(0,wiredownload(serverpath,hostpath))
             failure = False
             thread.start_new_thread(self.processdownloadqueue,())

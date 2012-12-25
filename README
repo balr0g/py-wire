@@ -38,13 +38,10 @@ this README.
 ===============
 
 Requirements:
-  Python 2.3.3 or greater is recommended.[3]  I haven't done any testing on 
-  older versions of Python, but anything less than 2.2 definitely won't work, 
-  as list comprehensions are used.  Please post on SourceForge if you are able 
-  to successfully run it with an older version of Python. 
+  Python 2.3 or greater is required.[3] 
   
-  TLS Lite 0.3.3 or greater is recommended.[4]  I haven't used any other 
-  versions, so I'm not sure if they work.
+  TLS Lite is requred, with 0.3.3 or greater recommended.[4]  I haven't used 
+  older versions, so I'm not sure if they work.
   
 Options:
   TLS Lite is a pure Python library, and the encryption that Wired uses is very
@@ -138,6 +135,11 @@ Not much documentation is currently available.  I'm going to try to get an FAQ
 
 7 History
 ==========
+0.3.2 - 2004-09-12
+- Upon disconnecting, add files in the server's queue back to the client queue
+- Make every possible attempt to associate a wirepath with every download,
+  in order to ensure the size of every download can be determined
+- Minor utf8 encoding bugfix
 0.3.1 - 2004-09-01
 - Better designed queue processing and transfer functions
 - Fix infinite loop when trying to download the root directory
